@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>CipherLink</title>
+<style>
+    body {
+        font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
+        margin: 2rem;
+        line-height: 1.4
+    }
+
+    input,
+    button,
+    textarea {
+        font: inherit;
+        padding: .5rem;
+        border: 1px solid #ccc;
+        border-radius: .4rem
+    }
+
+    button {
+        cursor: pointer
+    }
+
+    .row {
+        display: flex;
+        gap: .5rem;
+        align-items: center;
+        margin: .5rem 0
+    }
+
+    .out {
+        white-space: pre-wrap;
+        border: 1px dashed #ddd;
+        padding: 1rem;
+        border-radius: .5rem;
+        background: #fafafa
+    }
+</style>
+
+<body>
+    <h1>CipherLink</h1>
+    <p>Enter password to decrypt</p>
+    <form id="form">
+        <div class="row">
+            <input id="pw" type="password" placeholder="Password" required />
+            <button type="submit">Decrypt</button>
+        </div>
+    </form>
+    <div id="status"></div>
+    <p id="advert" style="display: none;">If you want to use this tool to send secrets yourself, go to <a
+            href="https://github.com/hillac/CipherLink">https://github.com/hillac/CipherLink</a></p>
+
+    <h3>Result</h3>
+    <div id="out" class="out"></div>
+
+    <script type="module-source" id="aes256gcm-script">
+        __INCLUDE_AES256GCM_JS_2__
+    </script>
+
+    <script type="module-source" id="pbkdf2-script">
+        __INCLUDE_PBKDF2_JS_2__
+    </script>
+
+    <script type="module">
+        const $ = (s) => document.querySelector(s);
+
+        async function loadInlineModule(id) {
+            const code = $('#' + id).textContent;
+            const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+            return await import(url);
+        }
+
+        const aes256gcm = await loadInlineModule('aes256gcm-script');
+        const pbkdf2 = await loadInlineModule('pbkdf2-script');
+
+        // === Filled by the generator ===
+        const CIPHERTEXT_B64 = "__CIPHERTEXT_B64__";
+        const IV_B64 = "__IV_B64__";
+        const SALT_B64 = "__SALT_B64__";
+        const TAG_B64 = "__TAG_B64__";
+        const ITERATIONS = __ITERATIONS__;
+
+        const enc = new TextEncoder();
+        const dec = new TextDecoder();
+
+        const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+
+        async function decryptSecret(password) {
+            const salt = b64ToBytes(SALT_B64);
+            const iv = b64ToBytes(IV_B64);
+            const ciphertext = b64ToBytes(CIPHERTEXT_B64);
+            const tag = b64ToBytes(TAG_B64);
+
+            // Derive key using pure JS PBKDF2
+            const key = pbkdf2.pbkdf2Sha256({
+                password: enc.encode(password),
+                salt: salt,
+                iterations: ITERATIONS,
+                dkLen: 32 // 256 bits for AES-256
+            });
+
+            try {
+                // Decrypt using AES-GCM
+                const result = aes256gcm.aes256GcmDecrypt({
+                    key: key,
+                    iv: iv,
+                    ciphertext: ciphertext,
+                    tag: tag
+                });
+
+                if (!result.ok) {
+                    throw new Error("Decryption failed");
+                }
+
+                return dec.decode(result.plaintext);
+            } catch (e) {
+                throw new Error("Decryption failed (wrong password or corrupted data).");
+            }
+        }
+
+        $("#form").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const status = $("#status");
+            const out = $("#out");
+            status.textContent = "Decrypting...";
+            out.textContent = "";
+            try {
+                const pw = $("#pw").value;
+                const plaintext = await decryptSecret(pw);
+                out.textContent = plaintext;
+                status.textContent = "Success.";
+                $("#advert").style.display = "block";
+            } catch (err) {
+                status.textContent = err.message;
+            }
+        });
+    </script>
+</body>
+
+</html>

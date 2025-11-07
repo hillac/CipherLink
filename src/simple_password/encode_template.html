@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>CipherLink</title>
+<style>
+  body {
+    font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
+    margin: 2rem;
+    line-height: 1.4
+  }
+
+  textarea {
+    width: 100%;
+    min-height: 8rem
+  }
+
+  input,
+  button,
+  textarea {
+    font: inherit;
+    padding: .5rem;
+    border: 1px solid #ccc;
+    border-radius: .4rem
+  }
+
+  button {
+    cursor: pointer
+  }
+
+  .row {
+    display: flex;
+    gap: .5rem;
+    align-items: center;
+    margin: .5rem 0
+  }
+
+  .out {
+    white-space: pre-wrap;
+    border: 1px dashed #ddd;
+    padding: 1rem;
+    border-radius: .5rem;
+    background: #fafafa;
+    word-break: break-all
+  }
+</style>
+
+<body>
+  <h1>CipherLink</h1>
+  <p>Send secrets with a Self-contained data URL using PBKDF2 + AES-GCM.</p>
+  <p>
+    <strong>Warning:</strong> Use this tool at your own risk. Always ensure you got the link from
+    <a href="https://github.com/hillac/CipherLink">https://github.com/hillac/CipherLink</a> and vet the code yourself.
+  </p>
+  <p>Make sure to use a strong password. This tool does not enforce any password strength requirements.</p>
+  <p>Make sure you send the password over a different channel to the data url. Or else you're just sending plain text.
+    Eg send data url on email and password on whatsapp as a disappeering message.</p>
+
+  <label>Secret</label>
+  <textarea id="secret" placeholder="Type your secret here..."></textarea>
+
+  <div class="row">
+    <label for="pw">Password:</label>
+    <input id="pw" type="password" placeholder="Password" />
+    <button id="generate-pw">Gen strong password</button>
+  </div>
+  <button id="go">Encrypt message</button>
+
+  <h3>Output</h3>
+  <div class="row">
+    <button id="copy-pw" type="button" class="copy-btn" style="margin-left: 0.5rem;">Copy Password</button>
+    <button id="copy-url" class="copy-btn" style="display: none;">Copy URL</button>
+  </div>
+
+  <div id="url" class="out"></div>
+
+  <template id="decode-template">
+    __DECODE_HTML__
+  </template>
+
+  <!-- nonsense type to avoid execution -->
+  <script type="module-source" id="aes256gcm-script">
+    __INCLUDE_AES256GCM_JS__
+  </script>
+
+  <script type="module-source" id="pbkdf2-script">
+    __INCLUDE_PBKDF2_JS__
+  </script>
+
+  <script type="module">
+
+    const $ = (s) => document.querySelector(s);
+
+    async function loadInlineModule(id) {
+      const code = $('#' + id).textContent;
+      const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+      return { module: await import(url), code };
+    }
+
+    const aes256gcm = await loadInlineModule('aes256gcm-script');
+    const pbkdf2 = await loadInlineModule('pbkdf2-script');
+
+    const DECODE_TEMPLATE = $("#decode-template").innerHTML;
+
+    // --- helpers ---
+    const enc = new TextEncoder();
+    const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+    const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+    async function encryptSecret(secret, password, iterations) {
+      const salt = rand(16);
+      const iv = rand(12);
+      // subtle is not available in data urls. use pure JS implementations.
+      // Derive key using PBKDF2
+      const key = pbkdf2.module.pbkdf2Sha256({
+        password: enc.encode(password),
+        salt: salt,
+        iterations: iterations,
+        dkLen: 32 // 256 bits for AES-256
+      });
+
+      // Encrypt using AES-GCM
+      const { ciphertext, tag } = aes256gcm.module.aes256GcmEncrypt({
+        key: key,
+        iv: iv,
+        plaintext: enc.encode(secret)
+      });
+
+      return { ctB64: b64(ciphertext), ivB64: b64(iv), saltB64: b64(salt), tagB64: b64(tag) };
+    }
+
+    function buildDecodeHTML(template, { ctB64, ivB64, saltB64, tagB64 }, iterations) {
+      return template
+        .replaceAll("__CIPHERTEXT_B64__", ctB64)
+        .replaceAll("__IV_B64__", ivB64)
+        .replaceAll("__SALT_B64__", saltB64)
+        .replaceAll("__TAG_B64__", tagB64)
+        .replaceAll("__ITERATIONS__", String(iterations))
+        .replaceAll("__INCLUDE_AES256GCM_JS_2__", aes256gcm.code)
+        .replaceAll("__INCLUDE_PBKDF2_JS_2__", pbkdf2.code);
+    }
+
+    function toDataURL(html) {
+      // Base64-encode UTF-8 safely
+      const utf8 = new TextEncoder().encode(html);
+      let s = "";
+      for (const c of utf8) s += String.fromCharCode(c);
+      const b64 = btoa(s);
+      return `data:text/html;base64,${b64}`;
+    }
+
+    async function copyToClipboard(text, button) {
+      const originalText = button.textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (err) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      button.textContent = "Copied!";
+      setTimeout(() => {
+        button.textContent = originalText;
+      }, 2000);
+    }
+
+    $("#copy-pw").addEventListener("click", () => {
+      const pw = $("#pw").value;
+      if (pw) copyToClipboard(pw, $("#copy-pw"));
+    });
+
+    $("#copy-url").addEventListener("click", () => {
+      const url = $("#url").textContent;
+      if (url && url !== "Encrypting..." && !url.startsWith("Error:")) {
+        copyToClipboard(url, $("#copy-url"));
+      }
+    });
+
+    $("#generate-pw").addEventListener("click", () => {
+      const pw = b64(rand(24)).replace(/\+/g, 'A').replace(/\//g, 'B').replace(/=/g, '');
+      $("#pw").value = pw;
+    });
+
+    $("#go").addEventListener("click", async () => {
+      const secret = ($("#secret").value || "");
+      const pw = ($("#pw").value || "");
+      const iters = 500_000;
+      const out = $("#url");
+      const copyUrlBtn = $("#copy-url");
+
+      if (!pw) { out.textContent = "Please enter a password."; return; }
+
+      out.textContent = "Encrypting...";
+      copyUrlBtn.style.display = "none";
+
+      try {
+        const payload = await encryptSecret(secret, pw, iters);
+        const decodeHTML = buildDecodeHTML(DECODE_TEMPLATE, payload, iters);
+        const url = toDataURL(decodeHTML);
+        out.textContent = url;
+        copyUrlBtn.style.display = "inline-block";
+      } catch (err) {
+        out.textContent = `Error: ${err.message}`;
+        copyUrlBtn.style.display = "none";
+      }
+    });
+  </script>
+</body>
+
+</html>
