@@ -16,6 +16,11 @@ Build it by running build.py. Or use the build output url at the end of this rea
 
 # URL
 Copy this url into your browser bar to use the tool:
+Password tool:
 ```url
-__ENCODE_URL__
+__ENCODE_URL_PASSWORD__
+```
+Key Exchange tool:
+```url
+__ENCODE_URL_KEY_EXCHANGE__
 ```

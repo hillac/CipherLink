@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>CipherLink - Key Exchange</title>
+<style>
+  body {
+    font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
+    margin: 2rem;
+    line-height: 1.4
+  }
+
+  textarea {
+    width: 100%;
+    min-height: 8rem
+  }
+
+  input,
+  button,
+  textarea {
+    font: inherit;
+    padding: .5rem;
+    border: 1px solid #ccc;
+    border-radius: .4rem
+  }
+
+  button {
+    cursor: pointer
+  }
+
+  .row {
+    display: flex;
+    gap: .5rem;
+    align-items: center;
+    margin: .5rem 0
+  }
+
+  .out {
+    white-space: pre-wrap;
+    border: 1px dashed #ddd;
+    padding: 1rem;
+    border-radius: .5rem;
+    background: #fafafa;
+    word-break: break-all
+  }
+
+  .hidden {
+    display: none;
+  }
+
+  .step {
+    margin: 1rem 0;
+    padding: 1rem;
+    border: 1px solid #ddd;
+    border-radius: .5rem;
+    background: #f9f9f9;
+  }
+
+  .step h3 {
+    margin-top: 0;
+  }
+</style>
+
+<body>
+  <h1>CipherLink - Key Exchange</h1>
+  <p>Send secrets securely using X25519 key exchange + AES-GCM encryption.</p>
+  <p>
+    <strong>Warning:</strong> Use this tool at your own risk. Always ensure you got the link from
+    <a href="https://github.com/hillac/CipherLink">https://github.com/hillac/CipherLink</a> and vet the code yourself.
+  </p>
+
+  <!-- Step 1: Initial message encryption -->
+  <div id="step1" class="step">
+    <h3>Step 1: Enter your secret message</h3>
+    <label>Secret</label>
+    <textarea id="secret" placeholder="Type your secret here..."></textarea>
+    <div class="row">
+      <button id="encrypt-btn">Encrypt & Generate Exchange Link</button>
+      <button id="show-secret-btn" class="hidden">Show Secret</button>
+    </div>
+    <div id="url-output" class="hidden">
+      <h4>Send this link to the recipient:</h4>
+      <div class="row">
+        <button id="copy-url" class="copy-btn">Copy Exchange Link</button>
+      </div>
+      <div id="url" class="out"></div>
+    </div>
+  </div>
+
+  <!-- Step 2: Wait for recipient's public key -->
+  <div id="step2" class="step hidden">
+    <h3>Step 2: Enter recipient's public key</h3>
+    <p>The recipient will send you their public key. Paste it below:</p>
+    <div class="row">
+      <label for="recipient-pubkey">Recipient's Public Key:</label>
+      <input id="recipient-pubkey" type="text" placeholder="Paste recipient's public key here" />
+      <button id="generate-encrypted-key">Generate Encrypted Key</button>
+    </div>
+    <div id="encrypted-key-output" class="hidden">
+      <h4>Send this encrypted key back to the recipient:</h4>
+      <div class="row">
+        <button id="copy-encrypted-key" class="copy-btn">Copy Encrypted Key</button>
+      </div>
+      <div id="encrypted-key" class="out"></div>
+    </div>
+  </div>
+
+  <template id="decode-template">
+    __DECODE_HTML__
+  </template>
+
+  <script type="module-source" id="aes256gcm-script">
+    __INCLUDE_AES256GCM_JS__
+  </script>
+
+  <script type="module-source" id="pbkdf2-script">
+    __INCLUDE_PBKDF2_JS__
+  </script>
+
+  <script type="module-source" id="x25519-script">
+    __INCLUDE_X25519_JS__
+  </script>
+
+  <script type="module">
+    const $ = (s) => document.querySelector(s);
+
+    async function loadInlineModule(id) {
+      const code = $('#' + id).textContent;
+      const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+      return { module: await import(url), code };
+    }
+
+    const aes256gcm = await loadInlineModule('aes256gcm-script');
+    const pbhkdf = await loadInlineModule('pbkdf2-script');
+    const x25519 = await loadInlineModule('x25519-script');
+
+    const DECODE_TEMPLATE = $("#decode-template").innerHTML;
+
+    // Global state
+    let encryptionKey = null;
+    let myPrivateKey = null;
+    let myPublicKey = null;
+
+    // --- helpers ---
+    const enc = new TextEncoder();
+    const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+    const unb64 = (str) => new Uint8Array([...atob(str)].map(c => c.charCodeAt(0)));
+    const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+    async function encryptMessage(message) {
+      encryptionKey = rand(32); // Generate random key
+      const iv = rand(12);
+
+      const { ciphertext, tag } = aes256gcm.module.aes256GcmEncrypt({
+        key: encryptionKey,
+        iv: iv,
+        plaintext: enc.encode(message)
+      });
+
+      return { ctB64: b64(ciphertext), ivB64: b64(iv), tagB64: b64(tag) };
+    }
+
+    function buildDecodeHTML(template, { ctB64, ivB64, tagB64, pubAB64 }) {
+      return template
+        .replaceAll("__CIPHERTEXT_B64__", ctB64)
+        .replaceAll("__IV_B64__", ivB64)
+        .replaceAll("__TAG_B64__", tagB64)
+        .replaceAll("__PUBA_B64__", pubAB64)
+        .replaceAll("__INCLUDE_AES256GCM_JS_2__", aes256gcm.code)
+        .replaceAll("__INCLUDE_PBKDF2_JS_2__", pbhkdf.code)
+        .replaceAll("__INCLUDE_X25519_JS_2__", x25519.code)
+    }
+
+    function toDataURL(html) {
+      const utf8 = new TextEncoder().encode(html);
+      let s = "";
+      for (const c of utf8) s += String.fromCharCode(c);
+      const b64url = btoa(s);
+      return `data:text/html;base64,${b64url}`;
+    }
+
+    async function copyToClipboard(text, button) {
+      const originalText = button.textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (err) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      button.textContent = "Copied!";
+      setTimeout(() => {
+        button.textContent = originalText;
+      }, 2000);
+    }
+
+    // Event listeners
+    $("#encrypt-btn").addEventListener("click", async () => {
+      const secret = $("#secret").value.trim();
+      if (!secret) {
+        alert("Please enter a secret message.");
+        return;
+      }
+
+      try {
+        // Encrypt the message
+        const payload = await encryptMessage(secret);
+
+        // Generate X25519 keypair
+        const keypair = x25519.module.generateKeyPair();
+        myPrivateKey = keypair.secretKey;
+        myPublicKey = keypair.publicKey;
+
+        // Build decode template with ciphertext and our public key
+        const decodeHTML = buildDecodeHTML(DECODE_TEMPLATE, {
+          ...payload,
+          pubAB64: b64(myPublicKey)
+        });
+
+        const url = toDataURL(decodeHTML);
+        $("#url").textContent = url;
+
+        // Update UI
+        $("#secret").disabled = true;
+        $("#encrypt-btn").style.display = "none";
+        $("#show-secret-btn").classList.remove("hidden");
+        $("#url-output").classList.remove("hidden");
+        $("#step2").classList.remove("hidden");
+
+      } catch (err) {
+        alert(`Error: ${err.message}`);
+      }
+    });
+
+    $("#show-secret-btn").addEventListener("click", () => {
+      $("#secret").disabled = !$("#secret").disabled;
+      $("#show-secret-btn").textContent = $("#secret").disabled ? "Show Secret" : "Hide Secret";
+    });
+
+    $("#copy-url").addEventListener("click", () => {
+      const url = $("#url").textContent;
+      if (url) copyToClipboard(url, $("#copy-url"));
+    });
+
+    $("#generate-encrypted-key").addEventListener("click", async () => {
+      const recipientPubKeyB64 = $("#recipient-pubkey").value.trim();
+      if (!recipientPubKeyB64) {
+        alert("Please enter the recipient's public key.");
+        return;
+      }
+
+      try {
+        const recipientPubKey = unb64(recipientPubKeyB64);
+
+        // Generate shared secret
+        const sharedSecret = x25519.module.sharedKey(myPrivateKey, recipientPubKey);
+
+        // Derive shared key using HMAC
+        const sharedKey = pbhkdf.module.makeHmacSha256Fn(sharedSecret)(enc.encode("CipherLink-KeyDerivation")).slice(0, 32);
+
+        // Encrypt the original message key
+        const iv = rand(12);
+        const { ciphertext, tag } = aes256gcm.module.aes256GcmEncrypt({
+          key: sharedKey,
+          iv: iv,
+          plaintext: encryptionKey
+        });
+
+        const encryptedKeyData = {
+          ct: b64(ciphertext),
+          iv: b64(iv),
+          tag: b64(tag)
+        };
+
+        $("#encrypted-key").textContent = JSON.stringify(encryptedKeyData);
+        $("#encrypted-key-output").classList.remove("hidden");
+
+        // Clean up sensitive data
+        myPrivateKey.fill(0);
+        sharedSecret.fill(0);
+        sharedKey.fill(0);
+
+      } catch (err) {
+        alert(`Error: ${err.message}`);
+      }
+    });
+
+    $("#copy-encrypted-key").addEventListener("click", () => {
+      const key = $("#encrypted-key").textContent;
+      if (key) copyToClipboard(key, $("#copy-encrypted-key"));
+    });
+
+  </script>
+</body>
+
+</html>
