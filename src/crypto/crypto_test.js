@@ -1,7 +1,12 @@
 // tests-aes256gcm.mjs
 import { aes256GcmDecrypt, aes256GcmEncrypt } from "./aes256gcm.js";
-import { pbkdf2Sha256, pbkdf2Sha256Hex, sha256 } from "./PBKDF2.js";
-import { x25519, generateKeyPair, deriveSharedSecret } from "./x25519.js";
+import {
+  pbkdf2Sha256,
+  pbkdf2Sha256Hex,
+  sha256,
+  makeHmacSha256Fn,
+} from "./PBKDF2.js";
+import { x25519, generateKeyPair, sharedKey } from "./x25519.js";
 
 // ---------- helpers ----------
 const hex = (u8) =>
@@ -244,6 +249,71 @@ async function runOneSha256(tc) {
   return { name: tc.name, digestHex: hex(ours), len: tc.msg.length };
 }
 
+// ------------- HMAC-SHA256 cases ------------------
+
+const hmacSha256Cases = [
+  {
+    name: "RFC-style: key/message",
+    key: enc.encode("key"),
+    msg: enc.encode("The quick brown fox jumps over the lazy dog"),
+  },
+  {
+    name: "Empty key",
+    key: new Uint8Array([]),
+    msg: enc.encode("Some message"),
+    expectThrows: true,
+  },
+  {
+    name: 'Key and empty message ("test key")',
+    key: enc.encode("test key"),
+    msg: new Uint8Array([]),
+  },
+  {
+    name: "Unicode key/message",
+    key: enc.encode("sēkrēt🔑"),
+    msg: enc.encode("mēssāgē📧"),
+  },
+  {
+    name: "Deterministic bytes key/message",
+    key: deterministicBytes(50, 11),
+    msg: deterministicBytes(100, 12),
+  },
+];
+
+async function runOneHmacSha256(tc) {
+  const key0 = clone(tc.key);
+  const msg0 = clone(tc.msg);
+  // Our HMAC-SHA256
+  let ours;
+  try {
+    ours = makeHmacSha256Fn(tc.key)(tc.msg);
+  } catch (e) {
+    if (tc.expectThrows) return;
+    throw e;
+  }
+  // WebCrypto HMAC
+  const cryptoKey = await subtle.importKey(
+    "raw",
+    tc.key,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const theirsBuf = await subtle.sign("HMAC", cryptoKey, tc.msg);
+  const theirs = new Uint8Array(theirsBuf);
+  if (!eq(ours, theirs)) {
+    throw new Error(
+      `[${tc.name}] HMAC-SHA256 mismatch\nours:   ${hex(ours)}\ntheirs: ${hex(
+        theirs
+      )}`
+    );
+  }
+
+  // Immutability
+  if (!eq(tc.key, key0)) throw new Error(`[${tc.name}] key mutated`);
+  if (!eq(tc.msg, msg0)) throw new Error(`[${tc.name}] message mutated`);
+}
+
 // --------------- PBKDF2-HMAC-SHA256 cases -------------------------
 
 const pbkdf2Cases = [
@@ -419,267 +489,182 @@ async function runOnePbkdfAes(tc) {
   };
 }
 
-// ---------- X25519 tests (revised) ----------
-//
-// Works in browsers and Node >=18. Avoids importing raw private keys into SubtleCrypto
-// (many engines reject that). Instead, we generate a Subtle keypair and cross-check
-// ECDH parity by mixing our keys with Subtle’s keys.
-//
-// Assumes in scope from your harness:
-//   - hex, u8, deterministicBytes, enc, eq, assert, clone
-//   - subtle (WebCrypto SubtleCrypto)
-// And your X25519 implementation exports:
-//   - x25519(privateKey32, publicU32)
-//   - generateKeyPair(seed32?)  -> { privateKey, publicKey }
-//   - deriveSharedSecret(myPrivateKey32, theirPublicKey32)
+// ---------- X25519 tests----------
 
-const X25519_BASE = (() => {
-  const b = new Uint8Array(32);
-  b[0] = 9;
-  return b;
-})();
+function runOneX25519GetSameKey() {
+  const alice = generateKeyPair();
+  const bob = generateKeyPair();
 
-// ---- RFC 7748 §5.2 vectors ----
-const RFC_SCALAR = u8(
-  "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
-);
-const RFC_PUBLIC = u8(
-  "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
-);
-const RFC_PEER_PUBLIC = u8(
-  "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
-);
-const RFC_SHARED = u8(
-  "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
-);
-const ALL_ZERO_PUB = new Uint8Array(32);
+  // serialise
+  const alicePub = hex(clone(alice.publicKey));
+  const bobPub = hex(clone(bob.publicKey));
 
-// ---- Subtle helpers (avoid importing private raw) ----
-async function subtleSupportsX25519() {
-  try {
-    const kp = await subtle.generateKey({ name: "X25519" }, false, [
-      "deriveBits",
-    ]);
-    // sanity derive with itself
-    const bits = await subtle.deriveBits(
-      { name: "X25519", public: kp.publicKey },
-      kp.privateKey,
-      256
-    );
-    return bits.byteLength === 32;
-  } catch {
-    return false;
-  }
+  //deserialise
+  const alicePub2 = u8(alicePub);
+  const bobPub2 = u8(bobPub);
+
+  // exchange
+  const aliceSecret = sharedKey(alice.secretKey, bobPub2);
+  const bobSecret = sharedKey(bob.secretKey, alicePub2);
+
+  assert(
+    eq(aliceSecret, bobSecret),
+    `X25519 derived shared secrets do not match`
+  );
 }
-async function subtleGenKeyPair() {
-  const kp = await subtle.generateKey({ name: "X25519" }, false, [
+
+async function runOneX25519MatchesSubtle() {
+  const subtle = crypto.subtle;
+  const aliceKeyPair = await subtle.generateKey({ name: "X25519" }, true, [
     "deriveBits",
   ]);
-  return kp; // {publicKey, privateKey}
-}
-async function subtleExportRawPublic(pubKey) {
-  const raw = await subtle.exportKey("raw", pubKey);
-  return new Uint8Array(raw); // 32 bytes u-coordinate
-}
-async function subtleImportRawPublic(raw32) {
-  return subtle.importKey("raw", raw32, { name: "X25519" }, false, []);
-}
-async function subtleDeriveWithSubtlePriv(subtlePriv, peerPubRaw32) {
-  const peerPub = await subtleImportRawPublic(peerPubRaw32);
-  const bits = await subtle.deriveBits(
-    { name: "X25519", public: peerPub },
-    subtlePriv,
+  const rawAlicePublicKey = await subtle.exportKey(
+    "raw",
+    aliceKeyPair.publicKey
+  );
+
+  const bobKeyPair = generateKeyPair();
+  const subtleImportBobPub = await subtle.importKey(
+    "raw",
+    bobKeyPair.publicKey,
+    { name: "X25519" },
+    true,
+    []
+  );
+
+  const aliceSharedBits = await subtle.deriveBits(
+    { name: "X25519", public: subtleImportBobPub },
+    aliceKeyPair.privateKey,
     256
   );
-  return new Uint8Array(bits);
+  const aliceShared = new Uint8Array(aliceSharedBits);
+  const bobShared = sharedKey(
+    bobKeyPair.secretKey,
+    new Uint8Array(rawAlicePublicKey)
+  );
+
+  assert(
+    eq(aliceShared, bobShared),
+    `X25519 derived shared secrets do not match SubtleCrypto`
+  );
 }
 
-// ---- deterministic pairs (ours only; some engines can’t import raw private) ----
-function detKeyPair(seedA, seedB) {
-  const a = generateKeyPair(deterministicBytes(32, seedA));
-  const b = generateKeyPair(deterministicBytes(32, seedB));
-  return { a, b };
-}
-
-// ---- Test cases ----
-const x25519Cases = [
-  // RFC known-answer tests (strict; if these fail, your impl is wrong)
+const testVectors = [
+  // Test vectors from RFC 7748 §5.2
   {
-    name: "RFC7748 scalar*base → public",
-    kind: "scalar-base-rfc",
-    scalar: RFC_SCALAR,
-    base: X25519_BASE,
-    wantU: RFC_PUBLIC,
+    scalar: "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+    u: "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+    expected:
+      "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552",
   },
   {
-    name: "RFC7748 ECDH shared secret",
-    kind: "shared-rfc",
-    aPriv: RFC_SCALAR,
-    bPub: RFC_PEER_PUBLIC,
-    wantShared: RFC_SHARED,
+    scalar: "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+    u: "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493",
+    expected:
+      "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957",
   },
-
-  // Ours-only parity checks (deterministic)
-  ...[1, 2, 3, 4, 5].map((i) => {
-    const { a, b } = detKeyPair(100 + i, 200 + i);
-    return {
-      name: `Deterministic ECDH (ours) #${i}`,
-      kind: "ours-derive",
-      aPriv: a.privateKey,
-      aPub: a.publicKey,
-      bPriv: b.privateKey,
-      bPub: b.publicKey,
-    };
-  }),
-
-  // Small-subgroup/invalid public (all-zero)
+  // small order point
   {
-    name: "All-zero public → all-zero shared",
-    kind: "all-zero-peer",
-    aSeed: 12345,
+    scalar: "0900000000000000000000000000000000000000000000000000000000000000",
+    u: "0000000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "0000000000000000000000000000000000000000000000000000000000000000",
   },
-
-  // Wrong-size inputs
+  // RFC 7748 §6.1 Alice private key
   {
-    name: "Wrong private length (31 bytes)",
-    kind: "bad-input",
-    aPriv: deterministicBytes(31, 777),
-    bPub: X25519_BASE,
+    scalar: "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    u: "0900000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
   },
+  // RFC 7748 §6.1 Bobs private, alice's public -> shared secret
   {
-    name: "Wrong public length (33 bytes)",
-    kind: "bad-input",
-    aPriv: deterministicBytes(32, 778),
-    bPub: new Uint8Array([...deterministicBytes(33, 779)]),
+    scalar: "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+    u: "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+    expected:
+      "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
   },
+  // RFC 7748 §6.1 Alice's private key, Bobs public -> shared secret
   {
-    name: "Empty inputs",
-    kind: "bad-input",
-    aPriv: new Uint8Array([]),
-    bPub: new Uint8Array([]),
+    scalar: "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    u: "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+    expected:
+      "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
   },
-
-  // Subtle parity via mixed-key ECDH (no private import)
-  // We create a Subtle keypair S and our keypair O. Then check:
-  //   subtle(private S, public O) == ours(private O, public S)
-  { name: "Subtle parity run #1", kind: "subtle-parity", seed: 901 },
-  { name: "Subtle parity run #2", kind: "subtle-parity", seed: 902 },
-  { name: "Subtle parity run #3", kind: "subtle-parity", seed: 903 },
-
-  // Random ‘u’ scalar multiplication compared to Subtle (via parity construct)
-  ...[11, 12, 13].map((i) => ({
-    name: `ScalarMult random-u #${i}`,
-    kind: "random-u",
-    seed: 300 + i,
-  })),
+  // wrong size u
+  {
+    scalar: "1234000000000000000000000000000000000000000000000000000000000000",
+    u: "00000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "0000000000000000000000000000000000000000000000000000000000000000",
+    expectThrows: true,
+  },
+  // wrong size scalar
+  {
+    scalar: "12340000000000000000000000000000000000000000000000000000000000",
+    u: "0000000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "0000000000000000000000000000000000000000000000000000000000000000",
+    expectThrows: true,
+  },
 ];
 
-// ---- Runner ----
-async function runOneX25519(tc) {
-  switch (tc.kind) {
-    case "scalar-base-rfc": {
-      const sc0 = clone(tc.scalar),
-        b0 = clone(tc.base);
-      const got = x25519(tc.scalar, tc.base);
-      assert(eq(got, tc.wantU), `[${tc.name}] scalar*base mismatch`);
-      assert(eq(tc.scalar, sc0), `[${tc.name}] scalar mutated`);
-      assert(eq(tc.base, b0), `[${tc.name}] base mutated`);
-      return { name: tc.name, uHex: hex(got) };
-    }
-    case "shared-rfc": {
-      const got = deriveSharedSecret(tc.aPriv, tc.bPub);
-      assert(eq(got, tc.wantShared), `[${tc.name}] shared mismatch vs RFC`);
-      return { name: tc.name, sharedHex: hex(got) };
-    }
-    case "ours-derive": {
-      // public = x25519(sk, base)
-      const aPubCalc = x25519(tc.aPriv, X25519_BASE);
-      const bPubCalc = x25519(tc.bPriv, X25519_BASE);
-      assert(
-        eq(aPubCalc, tc.aPub) && eq(bPubCalc, tc.bPub),
-        `[${tc.name}] public mismatch vs x25519(sk, base)`
-      );
+const x25519Cases = testVectors.map((tv, i) => ({
+  name: `RFC 7748 Vector ${i + 1}`,
+  vector: tv,
+  expectThrows: tv.expectThrows || false,
+}));
 
-      const ssAB = deriveSharedSecret(tc.aPriv, tc.bPub);
-      const ssBA = deriveSharedSecret(tc.bPriv, tc.aPub);
-      assert(eq(ssAB, ssBA), `[${tc.name}] shared secrets differ (ours)`);
-      return { name: tc.name, sharedHex: hex(ssAB) };
-    }
-    case "all-zero-peer": {
-      const a = generateKeyPair(deterministicBytes(32, tc.aSeed));
-      const ss = deriveSharedSecret(a.privateKey, ALL_ZERO_PUB);
-      const zero32 = new Uint8Array(32);
-      assert(eq(ss, zero32), `[${tc.name}] expected all-zero shared`);
-      return { name: tc.name, sharedHex: hex(ss) };
-    }
-    case "bad-input": {
-      let threw = false;
-      try {
-        x25519(tc.aPriv, tc.bPub);
-      } catch {
-        threw = true;
-      }
-      assert(threw, `[${tc.name}] our x25519 should throw`);
-      return { name: tc.name, threw };
-    }
-    case "subtle-parity": {
-      const supported = await subtleSupportsX25519();
-      if (!supported) {
-        // Mark as skipped but keep test harness happy
-        return {
-          name: tc.name,
-          skipped: true,
-          reason: "Subtle X25519 unsupported",
-        };
-      }
-      // Our keypair (deterministic)
-      const ours = generateKeyPair(deterministicBytes(32, tc.seed));
-      // Subtle keypair
-      const sub = await subtleGenKeyPair();
-      const subPubRaw = await subtleExportRawPublic(sub.publicKey);
-
-      // Cross-derive
-      const ss_ours = deriveSharedSecret(ours.privateKey, subPubRaw);
-      const ss_subtle = await subtleDeriveWithSubtlePriv(
-        sub.privateKey,
-        ours.publicKey
-      );
-
-      assert(
-        eq(ss_ours, ss_subtle),
-        `[${tc.name}] ours != SubtleCrypto with mixed keys`
-      );
-      return { name: tc.name, sharedHex: hex(ss_ours) };
-    }
-    case "random-u": {
-      const supported = await subtleSupportsX25519();
-      // Use parity construction if supported; otherwise just sanity-check length.
-      const scalar = deterministicBytes(32, tc.seed);
-      const randU = deterministicBytes(32, tc.seed + 777);
-      const ours = x25519(scalar, randU);
-      assert(ours.length === 32, `[${tc.name}] output length != 32`);
-
-      if (supported) {
-        // Create Subtle keypair S and challenge our point ‘randU’ via ladder equivalence:
-        // We cannot directly ask Subtle to multiply arbitrary ‘randU’ by an arbitrary scalar,
-        // but we can at least ensure our ECDH matches when mixing our point as a peer key.
-        const sub = await subtleGenKeyPair();
-        const subPubRaw = await subtleExportRawPublic(sub.publicKey);
-        const oursShared = deriveSharedSecret(scalar, subPubRaw); // clamps inside x25519
-        const subtleShared = await subtleDeriveWithSubtlePriv(
-          sub.privateKey,
-          x25519(scalar, X25519_BASE)
-        );
-        assert(
-          eq(oursShared, subtleShared),
-          `[${tc.name}] mismatch vs Subtle via parity`
-        );
-      }
-      return { name: tc.name, outHex: hex(ours), subtleChecked: supported };
-    }
-    default:
-      throw new Error(`Unknown test kind: ${tc.kind}`);
+async function runOneX25519OnTestVectors(tc) {
+  const tv = tc.vector;
+  const scalarU8 = u8(tv.scalar);
+  const uU8 = u8(tv.u);
+  let outU8;
+  try {
+    outU8 = x25519(scalarU8, uU8);
+  } catch (e) {
+    if (tc.expectThrows) return;
+    throw e;
   }
+  const outHex = hex(outU8);
+  if (outHex !== tv.expected) {
+    throw new Error(
+      `[${tc.name}] X25519 output mismatch\nexpected: ${tv.expected}\n got:    ${outHex}`
+    );
+  }
+}
+
+const smallOrderList = [
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+  "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+];
+
+const smallOrderCases = smallOrderList.map((hexStr, i) => ({
+  name: `Small Order Test ${i + 1}`,
+  hexStr,
+}));
+
+async function runOneX25519OnSmallOrder(tc) {
+  const pkRaw = u8(tc.hexStr);
+  const aliceKeyPair = generateKeyPair();
+  let derived;
+  try {
+    derived = sharedKey(aliceKeyPair.secretKey, pkRaw);
+  } catch {
+    return;
+  }
+  throw new Error(
+    `[${
+      tc.name
+    }] Expected error when using small order public key, but got derived key: ${hex(
+      derived
+    )}`
+  );
 }
 
 // ---------- runner -----------
@@ -687,13 +672,33 @@ async function runOneX25519(tc) {
 const tests = [
   { name: "AES-256-GCM", cases: aes256gcmcases, runner: runOneaes256gcm },
   { name: "SHA-256", cases: sha256Cases, runner: runOneSha256 },
+  { name: "HMAC-SHA256", cases: hmacSha256Cases, runner: runOneHmacSha256 },
   { name: "PBKDF2-HMAC-SHA256", cases: pbkdf2Cases, runner: runOnePbkdf2 },
   {
     name: "PBKDF2 + AES-256-GCM Integration",
     cases: pbkdfAESCases,
     runner: runOnePbkdfAes,
   },
-  { name: "X25519", cases: x25519Cases, runner: runOneX25519 },
+  {
+    name: "X25519 Key Agreement",
+    cases: [{ name: "basic" }, { name: "basic2" }],
+    runner: runOneX25519GetSameKey,
+  },
+  {
+    name: "X25519 vs SubtleCrypto",
+    cases: [{ name: "subtle match" }, { name: "subtle match2" }],
+    runner: runOneX25519MatchesSubtle,
+  },
+  {
+    name: "X25519 Test Vectors",
+    cases: x25519Cases,
+    runner: runOneX25519OnTestVectors,
+  },
+  {
+    name: "X25519 Small Order Public Keys",
+    cases: smallOrderCases,
+    runner: runOneX25519OnSmallOrder,
+  },
 ];
 
 async function runAll() {
@@ -703,7 +708,7 @@ async function runAll() {
     let failed = 0;
     for (const tc of testGroup.cases) {
       try {
-        const r = await testGroup.runner(tc);
+        await testGroup.runner(tc);
         console.log(`[PASS] ${tc.name}`);
       } catch (e) {
         failed++;

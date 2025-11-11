@@ -16,6 +16,7 @@ README_TEMPLATE = HERE / "readme-template" / "readme_template.md"
 def strip_js_comments(js: str) -> str:
     js = re.sub(r"//.*?$", "", js, flags=re.MULTILINE)
     js = re.sub(r"/\*.*?\*/", "", js, flags=re.DOTALL)
+    js = re.sub(r"\n\s*\n\s*\n+", "\n\n", js)
     return js
 
 def main():

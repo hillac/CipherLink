@@ -146,6 +146,13 @@ function makeHmacSha256(key) {
   return (msg) => sha256(concat(opad, sha256(concat(ipad, toU8(msg)))));
 }
 
+// public wrapper throws on bad key
+export function makeHmacSha256Fn(key) {
+  if (key == null || key.length === 0) throw new Error("HMAC key must be non-empty");
+  const hmac = makeHmacSha256(key);
+  return (msg) => hmac(msg);
+}
+
 // --------------- PBKDF2-HMAC-SHA256 ------------------
 // PBKDF2(P, S, c, dkLen) per RFC 8018 with PRF = HMAC-SHA256
 // T_i = U_1 xor U_2 xor ... xor U_c
