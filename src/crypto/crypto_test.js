@@ -378,7 +378,7 @@ async function runOnePbkdf2(tc) {
     salt: tc.salt,
     iterations: tc.iterations,
     dkLen: tc.dkLen,
-    makedHashFn: makeHmacSha256FnRaw,
+    makeHashFn: makeHmacSha256FnRaw,
   });
 
   // WebCrypto PBKDF2
@@ -520,7 +520,7 @@ async function runOnePbkdfAes(tc) {
     salt: tc.salt,
     iterations: tc.iterations,
     dkLen: tc.dkLen,
-    makedHashFn: makeHmacSha256FnRaw,
+    makeHashFn: makeHmacSha256FnRaw,
   });
 
   // Encrypt
