@@ -21,7 +21,7 @@ export function bigIntToLeBytes(x, len = 32) {
   return out;
 }
 
-// ----- Scalar clamping (RFC 7748 §5: decodeScalar25519) -----
+// ----- Scalar clamping (RFC 7748 §5) -----
 function clampScalar(k) {
   const s = new Uint8Array(k); // copy
   s[0] &= 248;

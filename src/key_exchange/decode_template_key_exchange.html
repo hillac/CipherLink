@@ -56,6 +56,11 @@
         background: #f9f9f9;
     }
 
+    .warn {
+        color: red;
+        font-weight: bold;
+    }
+
     .step h3 {
         margin-top: 0;
     }
@@ -73,7 +78,11 @@
     <!-- Step 1: Generate and share public key -->
     <div id="step1" class="step">
         <h3>Step 1: Generate your public key</h3>
-        <p>Click the button below to generate your public key, then send it back to the sender.</p>
+        <p>Click the button below to generate your public key, then send it back to the sender.<br />
+            <b class="warn">Important Warning! Read This first</b><br />
+            Make sure you send it over a different channel than the one you received the link on!<br />
+            Eg, if you received the link on email, send this data on whatsapp.<br />
+        </p>
         <button id="generate-keypair">Generate My Public Key</button>
 
         <div id="pubkey-output" class="hidden">
@@ -106,8 +115,12 @@
         __INCLUDE_AES256GCM_JS_2__
     </script>
 
-    <script type="module-source" id="pbkdf2-script">
-        __INCLUDE_PBKDF2_JS_2__
+    <script type="module-source" id="hmac-script">
+        __INCLUDE_HMAC_JS_2__
+    </script>
+
+    <script type="module-source" id="hkdf-script">
+        __INCLUDE_HKDF_JS_2__
     </script>
 
     <script type="module-source" id="x25519-script">
@@ -124,7 +137,8 @@
         }
 
         const aes256gcm = await loadInlineModule('aes256gcm-script');
-        const pbkdf2 = await loadInlineModule('pbkdf2-script');
+        const hmac = await loadInlineModule('hmac-script');
+        const hkdf = await loadInlineModule('hkdf-script');
         const x25519 = await loadInlineModule('x25519-script');
 
         // Embedded data
@@ -132,6 +146,7 @@
         const IV_B64 = "__IV_B64__";
         const TAG_B64 = "__TAG_B64__";
         const PUBA_B64 = "__PUBA_B64__";
+        const SALT_B64 = "__SALT_B64__";
 
         // Global state
         let myPrivateKey = null;
@@ -173,7 +188,15 @@
                 // Generate shared secret immediately and derive key
                 const senderPubKey = unb64(PUBA_B64);
                 const sharedSecret = x25519.module.sharedKey(myPrivateKey, senderPubKey);
-                sharedKey = pbkdf2.module.makeHmacSha256Fn(sharedSecret)(enc.encode("CipherLink-KeyDerivation")).slice(0, 32);
+                sharedKey = hkdf.module.hkdf(
+                    sharedSecret,
+                    {
+                        salt: unb64(SALT_B64),
+                        info: enc.encode("CipherLink-KeyDerivation"),
+                        length: 32
+                    },
+                    hmac.module.makeHmacSha256Fn
+                );
 
                 // Show public key to user
                 $("#my-pubkey").textContent = b64(myPublicKey);
@@ -184,7 +207,6 @@
                 // Clean up shared secret (keep sharedKey for later)
                 sharedSecret.fill(0);
                 myPrivateKey.fill(0);
-
             } catch (err) {
                 alert(`Error: ${err.message}`);
             }
@@ -236,10 +258,9 @@
                 $("#step3").classList.remove("hidden");
 
                 // Clean up sensitive data
-                messageKey.fill(0);
+                messageKey.plaintext.fill(0);
                 sharedKey.fill(0);
                 myPrivateKey.fill(0);
-
             } catch (err) {
                 alert(`Error decrypting message: ${err.message}`);
             }

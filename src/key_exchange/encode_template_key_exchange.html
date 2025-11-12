@@ -44,8 +44,18 @@
     word-break: break-all
   }
 
+  .url-output {
+    max-height: 5.4em;
+    overflow-y: auto;
+  }
+
   .hidden {
     display: none;
+  }
+
+  .warn {
+    color: red;
+    font-weight: bold;
   }
 
   .step {
@@ -80,24 +90,32 @@
     </div>
     <div id="url-output" class="hidden">
       <h4>Send this link to the recipient:</h4>
+      <p>Warning, it's a very long link!</p>
       <div class="row">
         <button id="copy-url" class="copy-btn">Copy Exchange Link</button>
       </div>
-      <div id="url" class="out"></div>
+      <div id="url" class="out url-output"></div>
     </div>
   </div>
 
   <!-- Step 2: Wait for recipient's public key -->
   <div id="step2" class="step hidden">
     <h3>Step 2: Enter recipient's public key</h3>
-    <p>The recipient will send you their public key. Paste it below:</p>
+    <p>The recipient will send you their public key.<br />
+      <b class="warn">Important Warning! Read this first</b><br/>
+      Make sure they send it over a different channel than the one you originally sent the
+      link on!
+      Eg, if you sent the link on email, ask them to send their public key on whatsapp.<br />
+      Ignore any data they send on the original channel and request they use a different channel.<br />
+      Paste it below:
+    </p>
     <div class="row">
-      <label for="recipient-pubkey">Recipient's Public Key:</label>
+      <label for="recipient-pubkey">Recipient's Data:</label>
       <input id="recipient-pubkey" type="text" placeholder="Paste recipient's public key here" />
       <button id="generate-encrypted-key">Generate Encrypted Key</button>
     </div>
     <div id="encrypted-key-output" class="hidden">
-      <h4>Send this encrypted key back to the recipient:</h4>
+      <h4>Send this encrypted key back to the recipient on the same channel they sent their data:</h4>
       <div class="row">
         <button id="copy-encrypted-key" class="copy-btn">Copy Encrypted Key</button>
       </div>
@@ -113,8 +131,12 @@
     __INCLUDE_AES256GCM_JS__
   </script>
 
-  <script type="module-source" id="pbkdf2-script">
-    __INCLUDE_PBKDF2_JS__
+  <script type="module-source" id="hmac-script">
+    __INCLUDE_HMAC_JS__
+  </script>
+
+  <script type="module-source" id="hkdf-script">
+    __INCLUDE_HKDF_JS__
   </script>
 
   <script type="module-source" id="x25519-script">
@@ -131,7 +153,8 @@
     }
 
     const aes256gcm = await loadInlineModule('aes256gcm-script');
-    const pbhkdf = await loadInlineModule('pbkdf2-script');
+    const hmac = await loadInlineModule('hmac-script');
+    const hkdf = await loadInlineModule('hkdf-script');
     const x25519 = await loadInlineModule('x25519-script');
 
     const DECODE_TEMPLATE = $("#decode-template").innerHTML;
@@ -140,6 +163,7 @@
     let encryptionKey = null;
     let myPrivateKey = null;
     let myPublicKey = null;
+    let salt = null;
 
     // --- helpers ---
     const enc = new TextEncoder();
@@ -148,8 +172,9 @@
     const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
 
     async function encryptMessage(message) {
-      encryptionKey = rand(32); // Generate random key
+      encryptionKey = rand(32);
       const iv = rand(12);
+      salt = rand(16);
 
       const { ciphertext, tag } = aes256gcm.module.aes256GcmEncrypt({
         key: encryptionKey,
@@ -157,17 +182,19 @@
         plaintext: enc.encode(message)
       });
 
-      return { ctB64: b64(ciphertext), ivB64: b64(iv), tagB64: b64(tag) };
+      return { ctB64: b64(ciphertext), ivB64: b64(iv), tagB64: b64(tag), saltB64: b64(salt) };
     }
 
-    function buildDecodeHTML(template, { ctB64, ivB64, tagB64, pubAB64 }) {
+    function buildDecodeHTML(template, { ctB64, ivB64, tagB64, pubAB64, saltB64 }) {
       return template
         .replaceAll("__CIPHERTEXT_B64__", ctB64)
         .replaceAll("__IV_B64__", ivB64)
         .replaceAll("__TAG_B64__", tagB64)
         .replaceAll("__PUBA_B64__", pubAB64)
+        .replaceAll("__SALT_B64__", saltB64)
         .replaceAll("__INCLUDE_AES256GCM_JS_2__", aes256gcm.code)
-        .replaceAll("__INCLUDE_PBKDF2_JS_2__", pbhkdf.code)
+        .replaceAll("__INCLUDE_HMAC_JS_2__", hmac.code)
+        .replaceAll("__INCLUDE_HKDF_JS_2__", hkdf.code)
         .replaceAll("__INCLUDE_X25519_JS_2__", x25519.code)
     }
 
@@ -258,8 +285,16 @@
         // Generate shared secret
         const sharedSecret = x25519.module.sharedKey(myPrivateKey, recipientPubKey);
 
-        // Derive shared key using HMAC
-        const sharedKey = pbhkdf.module.makeHmacSha256Fn(sharedSecret)(enc.encode("CipherLink-KeyDerivation")).slice(0, 32);
+        // Derive shared key using hkdf
+        const sharedKey = hkdf.module.hkdf(
+          sharedSecret,
+          {
+            salt: salt,
+            info: enc.encode("CipherLink-KeyDerivation"),
+            length: 32
+          },
+          hmac.module.makeHmacSha256Fn
+        );
 
         // Encrypt the original message key
         const iv = rand(12);
@@ -279,7 +314,7 @@
         $("#encrypted-key-output").classList.remove("hidden");
 
         // Clean up sensitive data
-        myPrivateKey.fill(0);
+        // myPrivateKey.fill(0);
         sharedSecret.fill(0);
         sharedKey.fill(0);
 

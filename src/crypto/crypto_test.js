@@ -1,11 +1,8 @@
 // tests-aes256gcm.mjs
 import { aes256GcmDecrypt, aes256GcmEncrypt } from "./aes256gcm.js";
-import {
-  pbkdf2Sha256,
-  pbkdf2Sha256Hex,
-  sha256,
-  makeHmacSha256Fn,
-} from "./PBKDF2.js";
+import { hkdf } from "./hkdf.js";
+import { pbkdf2 } from "./PBKDF2.js";
+import { sha256, makeHmacSha256Fn, makeHmacSha256FnRaw } from "./hmac.js";
 import { x25519, generateKeyPair, sharedKey } from "./x25519.js";
 
 // ---------- helpers ----------
@@ -283,22 +280,31 @@ const hmacSha256Cases = [
 async function runOneHmacSha256(tc) {
   const key0 = clone(tc.key);
   const msg0 = clone(tc.msg);
+
+  // WebCrypto HMAC
+  let cryptoKey;
+  let theirsThrows = false;
+  try {
+    cryptoKey = await subtle.importKey(
+      "raw",
+      tc.key,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+  } catch {
+    theirsThrows = true;
+  }
+
   // Our HMAC-SHA256
   let ours;
   try {
     ours = makeHmacSha256Fn(tc.key)(tc.msg);
   } catch (e) {
-    if (tc.expectThrows) return;
+    if (tc.expectThrows && theirsThrows) return;
     throw e;
   }
-  // WebCrypto HMAC
-  const cryptoKey = await subtle.importKey(
-    "raw",
-    tc.key,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
+
   const theirsBuf = await subtle.sign("HMAC", cryptoKey, tc.msg);
   const theirs = new Uint8Array(theirsBuf);
   if (!eq(ours, theirs)) {
@@ -367,11 +373,12 @@ async function runOnePbkdf2(tc) {
   const s0 = clone(tc.salt);
 
   // Our PBKDF2
-  const ours = pbkdf2Sha256({
+  const ours = pbkdf2({
     password: tc.password,
     salt: tc.salt,
     iterations: tc.iterations,
     dkLen: tc.dkLen,
+    makedHashFn: makeHmacSha256FnRaw,
   });
 
   // WebCrypto PBKDF2
@@ -405,24 +412,80 @@ async function runOnePbkdf2(tc) {
   // Immutability
   if (!eq(tc.password, p0)) throw new Error(`[${tc.name}] password mutated`);
   if (!eq(tc.salt, s0)) throw new Error(`[${tc.name}] salt mutated`);
+}
 
-  // Also sanity-check hex helper path
-  const oursHex = pbkdf2Sha256Hex({
-    password: tc.password,
-    salt: tc.salt,
-    iterations: tc.iterations,
-    dkLen: tc.dkLen,
-  });
-  if (oursHex !== hex(ours)) {
-    throw new Error(`[${tc.name}] hex helper mismatch`);
+// ----------------- HKDF cases ------------------
+
+const hkdfCases = [
+  {
+    name: "Basic: empty salt/info, 32B",
+    ikm: enc.encode("input key material"),
+    salt: new Uint8Array([]),
+    info: new Uint8Array([]),
+    length: 32,
+  },
+  {
+    name: "With salt/info, 64B",
+    ikm: enc.encode("another input key material"),
+    salt: enc.encode("some salt"),
+    info: enc.encode("context info"),
+    length: 64,
+  },
+  {
+    name: "Deterministic bytes, 128B",
+    ikm: deterministicBytes(50, 21),
+    salt: deterministicBytes(20, 22),
+    info: deterministicBytes(30, 23),
+    length: 128,
+  },
+  {
+    name: "Empty key",
+    ikm: new Uint8Array([]),
+    salt: enc.encode("salt"),
+    info: enc.encode("info"),
+    length: 32,
+  },
+];
+
+async function runOneHkdf(tc) {
+  // Preserve originals for immutability checks
+  const ikm0 = clone(tc.ikm);
+  const salt0 = clone(tc.salt);
+  const info0 = clone(tc.info);
+
+  // Our HKDF
+  const ours = hkdf(
+    tc.ikm,
+    { salt: tc.salt, info: tc.info, length: tc.length },
+    makeHmacSha256FnRaw
+  );
+
+  // WebCrypto HKDF
+  const key = await subtle.importKey("raw", tc.ikm, { name: "HKDF" }, false, [
+    "deriveBits",
+  ]);
+  const theirsBuf = await subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: tc.salt,
+      info: tc.info,
+    },
+    key,
+    tc.length * 8
+  );
+  const theirs = new Uint8Array(theirsBuf);
+
+  if (!eq(ours, theirs)) {
+    throw new Error(
+      `[${tc.name}] HKDF mismatch\nours:   ${hex(ours)}\ntheirs: ${hex(theirs)}`
+    );
   }
 
-  return {
-    name: tc.name,
-    dkLen: tc.dkLen,
-    iterations: tc.iterations,
-    dkHex: hex(ours),
-  };
+  // Immutability
+  if (!eq(tc.ikm, ikm0)) throw new Error(`[${tc.name}] ikm mutated`);
+  if (!eq(tc.salt, salt0)) throw new Error(`[${tc.name}] salt mutated`);
+  if (!eq(tc.info, info0)) throw new Error(`[${tc.name}] info mutated`);
 }
 
 // --------------- PBKDF2-HMAC-SHA256 + AES 256 GCM integration -------------------------
@@ -452,11 +515,12 @@ const pbkdfAESCases = [
 
 async function runOnePbkdfAes(tc) {
   // Derive key
-  const key = pbkdf2Sha256({
+  const key = pbkdf2({
     password: enc.encode(tc.password),
     salt: tc.salt,
     iterations: tc.iterations,
     dkLen: tc.dkLen,
+    makedHashFn: makeHmacSha256FnRaw,
   });
 
   // Encrypt
@@ -565,7 +629,7 @@ const testVectors = [
   },
   // small order point
   {
-    scalar: "0900000000000000000000000000000000000000000000000000000000000000",
+    scalar: "1234000000000000000000000000000000000000000000000000000000000000",
     u: "0000000000000000000000000000000000000000000000000000000000000000",
     expected:
       "0000000000000000000000000000000000000000000000000000000000000000",
@@ -667,12 +731,74 @@ async function runOneX25519OnSmallOrder(tc) {
   );
 }
 
+// ------ hkdf + x25519 integration ------
+
+async function runOneX25519HkdfIntegration() {
+  // Generate key pairs
+  const alice = generateKeyPair();
+
+  // bob uses subtle
+  const bob = await crypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveBits",
+    "deriveKey",
+  ]);
+  const bobPublicKeyBuf = await crypto.subtle.exportKey("raw", bob.publicKey);
+  const bobPublicKey = new Uint8Array(bobPublicKeyBuf);
+
+  const hkdfParams = {
+    salt: enc.encode("x25519 hkdf salt"),
+    info: enc.encode("x25519 hkdf info"),
+    length: 32,
+  };
+
+  // Derive shared secrets
+  const aliceShared = sharedKey(alice.secretKey, bobPublicKey);
+
+  // Derive keys via HKDF
+  const aliceKey = hkdf(aliceShared, hkdfParams, makeHmacSha256FnRaw);
+
+  // use subtle for bob
+  const subtleImportAlicePub = await crypto.subtle.importKey(
+    "raw",
+    alice.publicKey,
+    { name: "X25519" },
+    true,
+    []
+  );
+  const bobSharedKey = await crypto.subtle.deriveKey(
+    { name: "X25519", public: subtleImportAlicePub },
+    bob.privateKey,
+    { name: "HKDF" },
+    false,
+    ["deriveBits"]
+  );
+  // use subtle HKDF
+  const bobKeyBuf = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: hkdfParams.salt,
+      info: hkdfParams.info,
+    },
+    bobSharedKey,
+    hkdfParams.length * 8
+  );
+  const bobKey = new Uint8Array(bobKeyBuf);
+
+  // Compare
+  assert(
+    eq(aliceKey, bobKey),
+    `X25519 + HKDF derived keys do not match between parties`
+  );
+}
+
 // ---------- runner -----------
 
 const tests = [
   { name: "AES-256-GCM", cases: aes256gcmcases, runner: runOneaes256gcm },
   { name: "SHA-256", cases: sha256Cases, runner: runOneSha256 },
   { name: "HMAC-SHA256", cases: hmacSha256Cases, runner: runOneHmacSha256 },
+  { name: "HKDF-SHA256", cases: hkdfCases, runner: runOneHkdf },
   { name: "PBKDF2-HMAC-SHA256", cases: pbkdf2Cases, runner: runOnePbkdf2 },
   {
     name: "PBKDF2 + AES-256-GCM Integration",
@@ -698,6 +824,11 @@ const tests = [
     name: "X25519 Small Order Public Keys",
     cases: smallOrderCases,
     runner: runOneX25519OnSmallOrder,
+  },
+  {
+    name: "X25519 + HKDF Integration",
+    cases: [{ name: "25519 hkdf" }],
+    runner: runOneX25519HkdfIntegration,
   },
 ];
 
