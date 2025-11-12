@@ -87,6 +87,10 @@
     __INCLUDE_PBKDF2_JS__
   </script>
 
+  <script type="module-source" id="hmac-script">
+        __INCLUDE_HMAC_JS__
+  </script>
+
   <script type="module">
 
     const $ = (s) => document.querySelector(s);
@@ -99,6 +103,7 @@
 
     const aes256gcm = await loadInlineModule('aes256gcm-script');
     const pbkdf2 = await loadInlineModule('pbkdf2-script');
+    const hmac = await loadInlineModule('hmac-script');
 
     const DECODE_TEMPLATE = $("#decode-template").innerHTML;
 
@@ -112,11 +117,12 @@
       const iv = rand(12);
       // subtle is not available in data urls. use pure JS implementations.
       // Derive key using PBKDF2
-      const key = pbkdf2.module.pbkdf2Sha256({
+      const key = pbkdf2.module.pbkdf2({
         password: enc.encode(password),
         salt: salt,
         iterations: iterations,
-        dkLen: 32 // 256 bits for AES-256
+        dkLen: 32, // 256 bits for AES-256
+        makeHashFn: hmac.module.makeHmacSha256FnRaw
       });
 
       // Encrypt using AES-GCM
@@ -137,6 +143,7 @@
         .replaceAll("__TAG_B64__", tagB64)
         .replaceAll("__ITERATIONS__", String(iterations))
         .replaceAll("__INCLUDE_AES256GCM_JS_2__", aes256gcm.code)
+        .replaceAll("__INCLUDE_HMAC_JS_2__", hmac.code)
         .replaceAll("__INCLUDE_PBKDF2_JS_2__", pbkdf2.code);
     }
 

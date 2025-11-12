@@ -63,6 +63,10 @@
         __INCLUDE_PBKDF2_JS_2__
     </script>
 
+    <script type="module-source" id="hmac-script">
+        __INCLUDE_HMAC_JS_2__
+    </script>
+
     <script type="module">
         const $ = (s) => document.querySelector(s);
 
@@ -74,6 +78,7 @@
 
         const aes256gcm = await loadInlineModule('aes256gcm-script');
         const pbkdf2 = await loadInlineModule('pbkdf2-script');
+        const hmac = await loadInlineModule('hmac-script');
 
         // === Filled by the generator ===
         const CIPHERTEXT_B64 = "__CIPHERTEXT_B64__";
@@ -94,11 +99,12 @@
             const tag = b64ToBytes(TAG_B64);
 
             // Derive key using pure JS PBKDF2
-            const key = pbkdf2.pbkdf2Sha256({
+            const key = pbkdf2.pbkdf2({
                 password: enc.encode(password),
                 salt: salt,
                 iterations: ITERATIONS,
-                dkLen: 32 // 256 bits for AES-256
+                dkLen: 32, // 256 bits for AES-256
+                makeHashFn: hmac.makeHmacSha256FnRaw
             });
 
             try {

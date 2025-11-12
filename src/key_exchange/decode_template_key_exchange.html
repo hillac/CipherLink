@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>CipherLink - Receive Secret</title>
+<style>
+    body {
+        font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
+        margin: 2rem;
+        line-height: 1.4
+    }
+
+    textarea {
+        width: 100%;
+        min-height: 8rem
+    }
+
+    input,
+    button,
+    textarea {
+        font: inherit;
+        padding: .5rem;
+        border: 1px solid #ccc;
+        border-radius: .4rem
+    }
+
+    button {
+        cursor: pointer
+    }
+
+    .row {
+        display: flex;
+        gap: .5rem;
+        align-items: center;
+        margin: .5rem 0
+    }
+
+    .out {
+        white-space: pre-wrap;
+        border: 1px dashed #ddd;
+        padding: 1rem;
+        border-radius: .5rem;
+        background: #fafafa;
+        word-break: break-all
+    }
+
+    .hidden {
+        display: none;
+    }
+
+    .step {
+        margin: 1rem 0;
+        padding: 1rem;
+        border: 1px solid #ddd;
+        border-radius: .5rem;
+        background: #f9f9f9;
+    }
+
+    .warn {
+        color: red;
+        font-weight: bold;
+    }
+
+    .step h3 {
+        margin-top: 0;
+    }
+
+    .success {
+        background: #e8f5e8;
+        border-color: #4caf50;
+    }
+</style>
+
+<body>
+    <h1>CipherLink - Receive Secret</h1>
+    <p>You've received an encrypted message. Follow the steps below to decrypt it securely.</p>
+
+    <!-- Step 1: Generate and share public key -->
+    <div id="step1" class="step">
+        <h3>Step 1: Generate your public key</h3>
+        <p>Click the button below to generate your public key, then send it back to the sender.<br />
+            <b class="warn">Important Warning! Read This first</b><br />
+            Make sure you send it over a different channel than the one you received the link on!<br />
+            Eg, if you received the link on email, send this data on whatsapp.<br />
+        </p>
+        <button id="generate-keypair">Generate My Public Key</button>
+
+        <div id="pubkey-output" class="hidden">
+            <h4>Send this public key back to the sender:</h4>
+            <div class="row">
+                <button id="copy-pubkey" class="copy-btn">Copy My Public Key</button>
+            </div>
+            <div id="my-pubkey" class="out"></div>
+        </div>
+    </div>
+
+    <!-- Step 2: Receive encrypted key -->
+    <div id="step2" class="step hidden">
+        <h3>Step 2: Enter the encrypted key</h3>
+        <p>The sender will send you an encrypted key. Paste it below:</p>
+        <div class="row">
+            <label for="encrypted-key-input">Encrypted Key:</label>
+            <input id="encrypted-key-input" type="text" placeholder="Paste encrypted key here" />
+            <button id="decrypt-message">Decrypt Message</button>
+        </div>
+    </div>
+
+    <!-- Step 3: Show decrypted message -->
+    <div id="step3" class="step hidden success">
+        <h3>Step 3: Your decrypted message</h3>
+        <div id="decrypted-message" class="out"></div>
+    </div>
+
+    <script type="module-source" id="aes256gcm-script">
+        __INCLUDE_AES256GCM_JS_2__
+    </script>
+
+    <script type="module-source" id="hmac-script">
+        __INCLUDE_HMAC_JS_2__
+    </script>
+
+    <script type="module-source" id="hkdf-script">
+        __INCLUDE_HKDF_JS_2__
+    </script>
+
+    <script type="module-source" id="x25519-script">
+        __INCLUDE_X25519_JS_2__
+    </script>
+
+    <script type="module">
+        const $ = (s) => document.querySelector(s);
+
+        async function loadInlineModule(id) {
+            const code = $('#' + id).textContent;
+            const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+            return { module: await import(url), code };
+        }
+
+        const aes256gcm = await loadInlineModule('aes256gcm-script');
+        const hmac = await loadInlineModule('hmac-script');
+        const hkdf = await loadInlineModule('hkdf-script');
+        const x25519 = await loadInlineModule('x25519-script');
+
+        // Embedded data
+        const CIPHERTEXT_B64 = "__CIPHERTEXT_B64__";
+        const IV_B64 = "__IV_B64__";
+        const TAG_B64 = "__TAG_B64__";
+        const PUBA_B64 = "__PUBA_B64__";
+        const SALT_B64 = "__SALT_B64__";
+
+        // Global state
+        let myPrivateKey = null;
+        let myPublicKey = null;
+        let sharedKey = null;
+
+        // --- helpers ---
+        const enc = new TextEncoder();
+        const dec = new TextDecoder();
+        const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+        const unb64 = (str) => new Uint8Array([...atob(str)].map(c => c.charCodeAt(0)));
+
+        async function copyToClipboard(text, button) {
+            const originalText = button.textContent;
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch (err) {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+            }
+            button.textContent = "Copied!";
+            setTimeout(() => {
+                button.textContent = originalText;
+            }, 2000);
+        }
+
+        // Event listeners
+        $("#generate-keypair").addEventListener("click", () => {
+            try {
+                // Generate X25519 keypair
+                const keypair = x25519.module.generateKeyPair();
+                myPrivateKey = keypair.secretKey;
+                myPublicKey = keypair.publicKey;
+
+                // Generate shared secret immediately and derive key
+                const senderPubKey = unb64(PUBA_B64);
+                const sharedSecret = x25519.module.sharedKey(myPrivateKey, senderPubKey);
+                sharedKey = hkdf.module.hkdf(
+                    sharedSecret,
+                    {
+                        salt: unb64(SALT_B64),
+                        info: enc.encode("CipherLink-KeyDerivation"),
+                        length: 32
+                    },
+                    hmac.module.makeHmacSha256Fn
+                );
+
+                // Show public key to user
+                $("#my-pubkey").textContent = b64(myPublicKey);
+                $("#pubkey-output").classList.remove("hidden");
+                $("#step2").classList.remove("hidden");
+                $("#generate-keypair").disabled = true;
+
+                // Clean up shared secret (keep sharedKey for later)
+                sharedSecret.fill(0);
+                myPrivateKey.fill(0);
+            } catch (err) {
+                alert(`Error: ${err.message}`);
+            }
+        });
+
+        $("#copy-pubkey").addEventListener("click", () => {
+            const pubkey = $("#my-pubkey").textContent;
+            if (pubkey) copyToClipboard(pubkey, $("#copy-pubkey"));
+        });
+
+        $("#decrypt-message").addEventListener("click", async () => {
+            const encryptedKeyInput = $("#encrypted-key-input").value.trim();
+            if (!encryptedKeyInput) {
+                alert("Please enter the encrypted key.");
+                return;
+            }
+
+            try {
+                // Parse encrypted key data
+                const encryptedKeyData = JSON.parse(encryptedKeyInput);
+                const { ct, iv, tag } = encryptedKeyData;
+
+                // Decrypt the message key
+                const messageKey = aes256gcm.module.aes256GcmDecrypt({
+                    key: sharedKey,
+                    iv: unb64(iv),
+                    ciphertext: unb64(ct),
+                    tag: unb64(tag)
+                });
+
+                if (!messageKey.ok || messageKey.plaintext.length !== 32) {
+                    throw new Error("Decryption of message key failed");
+                }
+
+                // Decrypt the actual message
+                const message = aes256gcm.module.aes256GcmDecrypt({
+                    key: messageKey.plaintext,
+                    iv: unb64(IV_B64),
+                    ciphertext: unb64(CIPHERTEXT_B64),
+                    tag: unb64(TAG_B64)
+                });
+
+                if (!message.ok) {
+                    throw new Error("Decryption of message failed");
+                }
+
+                // Show decrypted message
+                $("#decrypted-message").textContent = dec.decode(message.plaintext);
+                $("#step3").classList.remove("hidden");
+
+                // Clean up sensitive data
+                messageKey.plaintext.fill(0);
+                sharedKey.fill(0);
+                myPrivateKey.fill(0);
+            } catch (err) {
+                alert(`Error decrypting message: ${err.message}`);
+            }
+        });
+
+    </script>
+</body>
+
+</html>

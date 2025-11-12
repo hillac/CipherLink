@@ -1,6 +1,9 @@
 // tests-aes256gcm.mjs
 import { aes256GcmDecrypt, aes256GcmEncrypt } from "./aes256gcm.js";
-import { pbkdf2Sha256, pbkdf2Sha256Hex, sha256 } from "./PBKDF2.js";
+import { hkdf } from "./hkdf.js";
+import { pbkdf2 } from "./PBKDF2.js";
+import { sha256, makeHmacSha256Fn, makeHmacSha256FnRaw } from "./hmac.js";
+import { x25519, generateKeyPair, sharedKey } from "./x25519.js";
 
 // ---------- helpers ----------
 const hex = (u8) =>
@@ -243,6 +246,80 @@ async function runOneSha256(tc) {
   return { name: tc.name, digestHex: hex(ours), len: tc.msg.length };
 }
 
+// ------------- HMAC-SHA256 cases ------------------
+
+const hmacSha256Cases = [
+  {
+    name: "RFC-style: key/message",
+    key: enc.encode("key"),
+    msg: enc.encode("The quick brown fox jumps over the lazy dog"),
+  },
+  {
+    name: "Empty key",
+    key: new Uint8Array([]),
+    msg: enc.encode("Some message"),
+    expectThrows: true,
+  },
+  {
+    name: 'Key and empty message ("test key")',
+    key: enc.encode("test key"),
+    msg: new Uint8Array([]),
+  },
+  {
+    name: "Unicode key/message",
+    key: enc.encode("sēkrēt🔑"),
+    msg: enc.encode("mēssāgē📧"),
+  },
+  {
+    name: "Deterministic bytes key/message",
+    key: deterministicBytes(50, 11),
+    msg: deterministicBytes(100, 12),
+  },
+];
+
+async function runOneHmacSha256(tc) {
+  const key0 = clone(tc.key);
+  const msg0 = clone(tc.msg);
+
+  // WebCrypto HMAC
+  let cryptoKey;
+  let theirsThrows = false;
+  try {
+    cryptoKey = await subtle.importKey(
+      "raw",
+      tc.key,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+  } catch {
+    theirsThrows = true;
+  }
+
+  // Our HMAC-SHA256
+  let ours;
+  try {
+    ours = makeHmacSha256Fn(tc.key)(tc.msg);
+  } catch (e) {
+    if (tc.expectThrows && theirsThrows) return;
+    throw e;
+  }
+
+  const theirsBuf = await subtle.sign("HMAC", cryptoKey, tc.msg);
+  const theirs = new Uint8Array(theirsBuf);
+  if (!eq(ours, theirs)) {
+    throw new Error(
+      `[${tc.name}] HMAC-SHA256 mismatch\nours:   ${hex(ours)}\ntheirs: ${hex(
+        theirs
+      )}`
+    );
+  }
+
+  // Immutability
+  if (!eq(tc.key, key0)) throw new Error(`[${tc.name}] key mutated`);
+  if (!eq(tc.msg, msg0)) throw new Error(`[${tc.name}] message mutated`);
+}
+
 // --------------- PBKDF2-HMAC-SHA256 cases -------------------------
 
 const pbkdf2Cases = [
@@ -296,11 +373,12 @@ async function runOnePbkdf2(tc) {
   const s0 = clone(tc.salt);
 
   // Our PBKDF2
-  const ours = pbkdf2Sha256({
+  const ours = pbkdf2({
     password: tc.password,
     salt: tc.salt,
     iterations: tc.iterations,
     dkLen: tc.dkLen,
+    makedHashFn: makeHmacSha256FnRaw,
   });
 
   // WebCrypto PBKDF2
@@ -334,24 +412,80 @@ async function runOnePbkdf2(tc) {
   // Immutability
   if (!eq(tc.password, p0)) throw new Error(`[${tc.name}] password mutated`);
   if (!eq(tc.salt, s0)) throw new Error(`[${tc.name}] salt mutated`);
+}
 
-  // Also sanity-check hex helper path
-  const oursHex = pbkdf2Sha256Hex({
-    password: tc.password,
-    salt: tc.salt,
-    iterations: tc.iterations,
-    dkLen: tc.dkLen,
-  });
-  if (oursHex !== hex(ours)) {
-    throw new Error(`[${tc.name}] hex helper mismatch`);
+// ----------------- HKDF cases ------------------
+
+const hkdfCases = [
+  {
+    name: "Basic: empty salt/info, 32B",
+    ikm: enc.encode("input key material"),
+    salt: new Uint8Array([]),
+    info: new Uint8Array([]),
+    length: 32,
+  },
+  {
+    name: "With salt/info, 64B",
+    ikm: enc.encode("another input key material"),
+    salt: enc.encode("some salt"),
+    info: enc.encode("context info"),
+    length: 64,
+  },
+  {
+    name: "Deterministic bytes, 128B",
+    ikm: deterministicBytes(50, 21),
+    salt: deterministicBytes(20, 22),
+    info: deterministicBytes(30, 23),
+    length: 128,
+  },
+  {
+    name: "Empty key",
+    ikm: new Uint8Array([]),
+    salt: enc.encode("salt"),
+    info: enc.encode("info"),
+    length: 32,
+  },
+];
+
+async function runOneHkdf(tc) {
+  // Preserve originals for immutability checks
+  const ikm0 = clone(tc.ikm);
+  const salt0 = clone(tc.salt);
+  const info0 = clone(tc.info);
+
+  // Our HKDF
+  const ours = hkdf(
+    tc.ikm,
+    { salt: tc.salt, info: tc.info, length: tc.length },
+    makeHmacSha256FnRaw
+  );
+
+  // WebCrypto HKDF
+  const key = await subtle.importKey("raw", tc.ikm, { name: "HKDF" }, false, [
+    "deriveBits",
+  ]);
+  const theirsBuf = await subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: tc.salt,
+      info: tc.info,
+    },
+    key,
+    tc.length * 8
+  );
+  const theirs = new Uint8Array(theirsBuf);
+
+  if (!eq(ours, theirs)) {
+    throw new Error(
+      `[${tc.name}] HKDF mismatch\nours:   ${hex(ours)}\ntheirs: ${hex(theirs)}`
+    );
   }
 
-  return {
-    name: tc.name,
-    dkLen: tc.dkLen,
-    iterations: tc.iterations,
-    dkHex: hex(ours),
-  };
+  // Immutability
+  if (!eq(tc.ikm, ikm0)) throw new Error(`[${tc.name}] ikm mutated`);
+  if (!eq(tc.salt, salt0)) throw new Error(`[${tc.name}] salt mutated`);
+  if (!eq(tc.info, info0)) throw new Error(`[${tc.name}] info mutated`);
 }
 
 // --------------- PBKDF2-HMAC-SHA256 + AES 256 GCM integration -------------------------
@@ -381,11 +515,12 @@ const pbkdfAESCases = [
 
 async function runOnePbkdfAes(tc) {
   // Derive key
-  const key = pbkdf2Sha256({
+  const key = pbkdf2({
     password: enc.encode(tc.password),
     salt: tc.salt,
     iterations: tc.iterations,
     dkLen: tc.dkLen,
+    makedHashFn: makeHmacSha256FnRaw,
   });
 
   // Encrypt
@@ -418,16 +553,282 @@ async function runOnePbkdfAes(tc) {
   };
 }
 
+// ---------- X25519 tests----------
+
+function runOneX25519GetSameKey() {
+  const alice = generateKeyPair();
+  const bob = generateKeyPair();
+
+  // serialise
+  const alicePub = hex(clone(alice.publicKey));
+  const bobPub = hex(clone(bob.publicKey));
+
+  //deserialise
+  const alicePub2 = u8(alicePub);
+  const bobPub2 = u8(bobPub);
+
+  // exchange
+  const aliceSecret = sharedKey(alice.secretKey, bobPub2);
+  const bobSecret = sharedKey(bob.secretKey, alicePub2);
+
+  assert(
+    eq(aliceSecret, bobSecret),
+    `X25519 derived shared secrets do not match`
+  );
+}
+
+async function runOneX25519MatchesSubtle() {
+  const subtle = crypto.subtle;
+  const aliceKeyPair = await subtle.generateKey({ name: "X25519" }, true, [
+    "deriveBits",
+  ]);
+  const rawAlicePublicKey = await subtle.exportKey(
+    "raw",
+    aliceKeyPair.publicKey
+  );
+
+  const bobKeyPair = generateKeyPair();
+  const subtleImportBobPub = await subtle.importKey(
+    "raw",
+    bobKeyPair.publicKey,
+    { name: "X25519" },
+    true,
+    []
+  );
+
+  const aliceSharedBits = await subtle.deriveBits(
+    { name: "X25519", public: subtleImportBobPub },
+    aliceKeyPair.privateKey,
+    256
+  );
+  const aliceShared = new Uint8Array(aliceSharedBits);
+  const bobShared = sharedKey(
+    bobKeyPair.secretKey,
+    new Uint8Array(rawAlicePublicKey)
+  );
+
+  assert(
+    eq(aliceShared, bobShared),
+    `X25519 derived shared secrets do not match SubtleCrypto`
+  );
+}
+
+const testVectors = [
+  // Test vectors from RFC 7748 §5.2
+  {
+    scalar: "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+    u: "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+    expected:
+      "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552",
+  },
+  {
+    scalar: "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+    u: "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493",
+    expected:
+      "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957",
+  },
+  // small order point
+  {
+    scalar: "1234000000000000000000000000000000000000000000000000000000000000",
+    u: "0000000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "0000000000000000000000000000000000000000000000000000000000000000",
+  },
+  // RFC 7748 §6.1 Alice private key
+  {
+    scalar: "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    u: "0900000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+  },
+  // RFC 7748 §6.1 Bobs private, alice's public -> shared secret
+  {
+    scalar: "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+    u: "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+    expected:
+      "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
+  },
+  // RFC 7748 §6.1 Alice's private key, Bobs public -> shared secret
+  {
+    scalar: "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    u: "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+    expected:
+      "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
+  },
+  // wrong size u
+  {
+    scalar: "1234000000000000000000000000000000000000000000000000000000000000",
+    u: "00000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "0000000000000000000000000000000000000000000000000000000000000000",
+    expectThrows: true,
+  },
+  // wrong size scalar
+  {
+    scalar: "12340000000000000000000000000000000000000000000000000000000000",
+    u: "0000000000000000000000000000000000000000000000000000000000000000",
+    expected:
+      "0000000000000000000000000000000000000000000000000000000000000000",
+    expectThrows: true,
+  },
+];
+
+const x25519Cases = testVectors.map((tv, i) => ({
+  name: `RFC 7748 Vector ${i + 1}`,
+  vector: tv,
+  expectThrows: tv.expectThrows || false,
+}));
+
+async function runOneX25519OnTestVectors(tc) {
+  const tv = tc.vector;
+  const scalarU8 = u8(tv.scalar);
+  const uU8 = u8(tv.u);
+  let outU8;
+  try {
+    outU8 = x25519(scalarU8, uU8);
+  } catch (e) {
+    if (tc.expectThrows) return;
+    throw e;
+  }
+  const outHex = hex(outU8);
+  if (outHex !== tv.expected) {
+    throw new Error(
+      `[${tc.name}] X25519 output mismatch\nexpected: ${tv.expected}\n got:    ${outHex}`
+    );
+  }
+}
+
+const smallOrderList = [
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+  "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+];
+
+const smallOrderCases = smallOrderList.map((hexStr, i) => ({
+  name: `Small Order Test ${i + 1}`,
+  hexStr,
+}));
+
+async function runOneX25519OnSmallOrder(tc) {
+  const pkRaw = u8(tc.hexStr);
+  const aliceKeyPair = generateKeyPair();
+  let derived;
+  try {
+    derived = sharedKey(aliceKeyPair.secretKey, pkRaw);
+  } catch {
+    return;
+  }
+  throw new Error(
+    `[${
+      tc.name
+    }] Expected error when using small order public key, but got derived key: ${hex(
+      derived
+    )}`
+  );
+}
+
+// ------ hkdf + x25519 integration ------
+
+async function runOneX25519HkdfIntegration() {
+  // Generate key pairs
+  const alice = generateKeyPair();
+
+  // bob uses subtle
+  const bob = await crypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveBits",
+    "deriveKey",
+  ]);
+  const bobPublicKeyBuf = await crypto.subtle.exportKey("raw", bob.publicKey);
+  const bobPublicKey = new Uint8Array(bobPublicKeyBuf);
+
+  const hkdfParams = {
+    salt: enc.encode("x25519 hkdf salt"),
+    info: enc.encode("x25519 hkdf info"),
+    length: 32,
+  };
+
+  // Derive shared secrets
+  const aliceShared = sharedKey(alice.secretKey, bobPublicKey);
+
+  // Derive keys via HKDF
+  const aliceKey = hkdf(aliceShared, hkdfParams, makeHmacSha256FnRaw);
+
+  // use subtle for bob
+  const subtleImportAlicePub = await crypto.subtle.importKey(
+    "raw",
+    alice.publicKey,
+    { name: "X25519" },
+    true,
+    []
+  );
+  const bobSharedKey = await crypto.subtle.deriveKey(
+    { name: "X25519", public: subtleImportAlicePub },
+    bob.privateKey,
+    { name: "HKDF" },
+    false,
+    ["deriveBits"]
+  );
+  // use subtle HKDF
+  const bobKeyBuf = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: hkdfParams.salt,
+      info: hkdfParams.info,
+    },
+    bobSharedKey,
+    hkdfParams.length * 8
+  );
+  const bobKey = new Uint8Array(bobKeyBuf);
+
+  // Compare
+  assert(
+    eq(aliceKey, bobKey),
+    `X25519 + HKDF derived keys do not match between parties`
+  );
+}
+
 // ---------- runner -----------
 
 const tests = [
   { name: "AES-256-GCM", cases: aes256gcmcases, runner: runOneaes256gcm },
   { name: "SHA-256", cases: sha256Cases, runner: runOneSha256 },
+  { name: "HMAC-SHA256", cases: hmacSha256Cases, runner: runOneHmacSha256 },
+  { name: "HKDF-SHA256", cases: hkdfCases, runner: runOneHkdf },
   { name: "PBKDF2-HMAC-SHA256", cases: pbkdf2Cases, runner: runOnePbkdf2 },
   {
     name: "PBKDF2 + AES-256-GCM Integration",
     cases: pbkdfAESCases,
     runner: runOnePbkdfAes,
+  },
+  {
+    name: "X25519 Key Agreement",
+    cases: [{ name: "basic" }, { name: "basic2" }],
+    runner: runOneX25519GetSameKey,
+  },
+  {
+    name: "X25519 vs SubtleCrypto",
+    cases: [{ name: "subtle match" }, { name: "subtle match2" }],
+    runner: runOneX25519MatchesSubtle,
+  },
+  {
+    name: "X25519 Test Vectors",
+    cases: x25519Cases,
+    runner: runOneX25519OnTestVectors,
+  },
+  {
+    name: "X25519 Small Order Public Keys",
+    cases: smallOrderCases,
+    runner: runOneX25519OnSmallOrder,
+  },
+  {
+    name: "X25519 + HKDF Integration",
+    cases: [{ name: "25519 hkdf" }],
+    runner: runOneX25519HkdfIntegration,
   },
 ];
 
@@ -438,7 +839,7 @@ async function runAll() {
     let failed = 0;
     for (const tc of testGroup.cases) {
       try {
-        const r = await testGroup.runner(tc);
+        await testGroup.runner(tc);
         console.log(`[PASS] ${tc.name}`);
       } catch (e) {
         failed++;
